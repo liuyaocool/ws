@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta charset="UTF-8">
+    <title>menu</title>
+
+	<style>
+		:root {
+			--bg-color: #373636;
+			--pad: 10px;
+		}
+		body {
+			background-color: var(--bg-color);
+			margin: 0;
+		}
+		body, body * {
+			box-sizing: border-box;
+			color: white;
+		}
+		#msgs {
+			position: absolute;
+			top: 10px;
+			left: 10px;
+			right: 10px;
+			bottom: 166px;
+			overflow: auto;
+		}
+		.msg {
+			margin-bottom: 15px;
+		}
+		.msg pre {
+			background-color: #80808038;
+			border-radius: 10px;
+			padding: 10px 5px;
+			width: fit-content;
+			/* margin-right: 10px; */
+			margin: 0;
+		}
+		.ot_msg pre {
+			/* margin-left: 5px; */
+		}
+		.my_msg {
+			display: flex;
+  			flex-direction: column;
+  			align-items: flex-end;
+  			padding-right: 10px;
+		}
+		.time {
+			font-size: 12px;
+			color: gray;
+		}
+		.btn {
+			background-color: gray;
+		}
+		.send {
+			float: right;
+		}
+		#textInput {
+			width: 100%;
+			height: 100px;
+			resize: none;
+			outline: none;
+			background-color: transparent;
+			border: gray 1px solid;
+		}
+		#textInput:focus {
+			border: lime 1px solid;
+		}
+
+		.func {
+			background-color: var(--bg-color);
+			position: absolute;
+  			/* bottom: var(--pad); */
+  			bottom: calc(15px +var(--pad));
+			left: var(--pad);
+			right: var(--pad);
+		}
+		#message {
+			position: absolute;
+			bottom: 0px;
+			text-align: center;
+			width: 100%;
+			font-size: 12px;
+		}
+		green { color: lime; }
+		yellow { color: orange; }
+		red { color: #ff6868; }
+	</style>
+</head>
+
+<body>
+
+<div id="msgs">
+	<!-- <div class="msg ot_msg">
+		<div class="time">2023-12-12 22:22:22</div>
+		<pre>hello</pre></div> -->
+</div>
+<div class="func">
+	<input class="btn" type="button" value="???">
+	<input class="btn send" type="button" value="发送" onclick="send()">
+	<!-- <button id="send" type="button">发送</button> -->
+	<textarea id="textInput"></textarea>
+</div>
+<div id="message"></div>
+
+<script>
+	const socket = new WebSocket("ws://127.0.0.1:8080");
+
+	socket.onopen = function(event) {
+		// updateStatus('connected', '已连接');
+		showMsg('I', '已成功连接到WebSocket服务器', 'system');
+	};
+	
+	socket.onmessage = function(event) {
+		addMsg('ot_msg', event.data);
+	};
+	
+	socket.onclose = function(event) {
+		updateStatus('disconnected', '连接已断开');
+		if (event.wasClean) {
+			showMsg('I', `连接已关闭，代码: ${event.code}, 原因: ${event.reason}`, 'system');
+		} else {
+			showMsg('E', '连接意外断开', 'system');
+		}
+	};
+	
+	socket.onerror = function(error) {
+		updateStatus('disconnected', '连接错误');
+		showMsg('E', '连接发生错误', 'system');
+		console.error('WebSocket错误:', error);
+	};
+
+	// 断开WebSocket连接
+	function disconnect() {
+		if (socket) {
+			socket.close();
+			socket = null;
+		}
+	}
+
+
+	// // 监听窗口关闭事件
+	// window.addEventListener('beforeunload', function(event) {
+	// 	// 显示确认对话框
+	// 	event.preventDefault();
+	// 	event.returnValue = '您确定要离开吗？未保存的更改可能会丢失。';
+	// 	return event.returnValue;
+	// });
+		
+		// 发送消息
+	function send() {
+		const message = textInput.value;
+		if (!message) return;
+		if (socket && socket.readyState === WebSocket.OPEN) {
+			socket.send(message);
+			addMsg('my_msg', message);
+		} else {
+			showMsg('E', '无法发送消息，连接未就绪', 'system');
+		}
+	}
+
+	function addMsg(clas, msg) {
+		msgs.innerHTML += `<div class="msg ${clas}">
+			<div class="time">${nowStr(true)}</div>
+			<pre class="">${msg}</pre></div>`;
+		msgs.scrollTo({
+			top: msgs.scrollHeight,
+			behavior: 'smooth'
+		});
+	}
+
+	function showMsg(type, msg) {
+		switch(type) {
+			case 'I': message.innerHTML = `<green>${msg}</green>`; break;
+			case 'W': message.innerHTML = `<yellow>${msg}</yellow>`; break;
+			case 'E': message.innerHTML = `<red>${msg}</red>`; break;
+		}
+		console.log(msg);
+	}
+
+	function updateStatus() {
+
+	}
+
+	function nowStr(hasTime) {
+		let now = new Date();
+		let a = now.getMonth() + 1;
+		let m = a < 10 ? ('0' + a) : a;
+		let d = (a = now.getDate()) < 10 ? ('0' + a) : a;
+		let h = (a = now.getHours()) < 10 ? ('0' + a) : a;
+		let mi = (a = now.getMinutes()) < 10 ? ('0' + a) : a;
+		let s = (a = now.getSeconds()) < 10 ? ('0' + a) : a;
+		return `${now.getFullYear()}-${m}-${d}${hasTime ? ` ${h}:${mi}:${s}` : ''}`;
+	}
+
+</script>
+</body>
+</html>
