@@ -30,7 +30,7 @@ struct ucli {
 };
 struct udata {
     // struct ucli *cli; // NULL 为可用状态
-    char buf[BUFFER_SIZE];
+    uint8_t buf[BUFFER_SIZE];
     int use; // 发送使用统计（给几个用户发送）, -1为可用
     // void *handler;
     void (*handler)(struct io_uring_cqe *, int, int);
@@ -236,14 +236,77 @@ void handler_close(struct io_uring_cqe *cqe, int cidx, int didx) {
     uclis[cidx].fd = -1;
     udatas[didx].use = -1;
 }
+
+// 解码数据
+int de_data(uint8_t *buf, size_t len, uint8_t *out) {
+    bool fin = (buf[0] & 0x80) != 0; // 1:最后一帧 0:还有数据未完成
+    bool masked = (buf[1] & 0x80) != 0;
+    size_t header_len = 2;
+    uint64_t data_len = buf[1] & 0x7F;
+    if (data_len == 126) {
+        if (len < 4) return 0;  // 帧不完整
+        data_len = ((uint64_t)buf[2] << 8) | buf[3];
+        header_len = 4;
+    } else if (data_len == 127) {
+        if (len < 10) return 0;  // 帧不完整
+        data_len = 0;
+        // 注意：只取低 63 位（RFC 规定最高位必须为 0）
+        for (int i = 0; i < 8; i++) {
+            data_len = (data_len << 8) | buf[2 + i];
+        }
+        header_len = 10;
+    }
+    uint8_t mask[4];
+    if (masked) {
+        if (len < header_len + 4) return 0;
+        memcpy(mask, buf + header_len, 4);
+        header_len += 4;
+    }
+    if (len < header_len + data_len) return 0; // 帧不完整
+    
+    size_t dest_len = 0;
+    uint8_t *dest_data;
+    // 第一字节: FIN=1 (0x80) | opcode
+    out[0] = 0x80 | (buf[0] & 0x0F);
+    // 第二字节: MASK=0 | payload length
+    if (data_len <= 125) {
+        out[1] = (uint8_t)data_len;
+        dest_data = out + 2;
+        dest_len = 2 + data_len;
+    } else if (data_len <= 65535) {
+        out[1] = 126; // 表示接下来 2 字节是长度
+        out[2] = (data_len >> 8) & 0xFF;
+        out[3] = data_len & 0xFF;
+        dest_data = out + 4;
+        dest_len = 4 + data_len;
+    } else {
+        // 注意：RFC 允许 8 字节长度（127），但大多数场景不需要
+        // 若需支持 >64KB，可扩展（但浏览器可能不兼容）
+        return 0; // 暂不支持超大帧
+    }
+    uint8_t *data = buf + header_len;
+
+    if (masked) {
+        for (size_t i = 0; i < data_len; i++) {
+            dest_data[i] = data[i] ^ mask[i % 4];
+        }
+    } else {
+        memcpy(dest_data, data, data_len);
+    }
+    printf("len=%d data = %s\n", data_len, dest_data);
+    return dest_len;
+}
 // read_thread
 void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
-    int opcode;
-    if (cqe->res <= 0 || 8 == (opcode = udatas[didx].buf[0] & 0x8)){
+    uint8_t opcode = udatas[didx].buf[0] & 0xF;
+    if (cqe->res <= 0 || 8 == opcode){
+        printf("fd=%d opcode=%d\n", uclis[cidx].fd, opcode);
         udatas[didx].handler = handler_close;
         submit_close(cidx, didx);
         return;
     }
+    int send_idx = get_udata();
+    int send_len = de_data(udatas[didx].buf, cqe->res, udatas[send_idx].buf);
     // printf("<<<<<<<< read len=%d cidx=%d, didx=%d ----- \n", cqe->res, cidx, didx);
     // switch (opcode) {
     //     case 0: break; // 继续帧 数据分片 浏览器不会传
@@ -254,18 +317,21 @@ void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
     //     case 10: break; // pong
     //     default: break;
     // }
-    udatas[didx].use = 0;
-    udatas[didx].handler = handler_write;
-    for (size_t i = 0; i < CLIENT_SIZE; i++) {
-        if (uclis[i].fd >= 0 && uclis[i].fd != uclis[cidx].fd) {
-            printc(BLUE, ">>>>>>>> write to %d %d -----\n", i, uclis[i].fd);
-            udatas[didx].use++;
-            submit_write(&write_ring, i, didx, cqe->res);
+    if (send_len > 0) {
+        udatas[send_idx].use = 0;
+        udatas[send_idx].handler = handler_write;
+        for (size_t i = 0; i < CLIENT_SIZE; i++) {
+            if (uclis[i].fd >= 0 && uclis[i].fd != uclis[cidx].fd) {
+                printc(BLUE, ">>>>>>>> write to %d %d -----\n", i, uclis[i].fd);
+                udatas[send_idx].use++;
+                submit_write(&write_ring, i, send_idx, send_len);
+            }
         }
+    } else {
+        udatas[send_idx].use = -1;
+        printf("fd=%d 收到数据不完整: %d\n", uclis[cidx].fd, cqe->res);
     }
     io_uring_submit(&write_ring);
-    didx = get_udata();
-    udatas[didx].handler = handler_read;
     submit_read(cidx, didx);
 }
 

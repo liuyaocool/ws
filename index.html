@@ -2,8 +2,10 @@
 <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
 <head>
     <meta charset="UTF-8">
-    <title>menu</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket</title>
 
+	<link rel="manifest" href="manifest.json">
 	<style>
 		:root {
 			--bg-color: #373636;
@@ -31,7 +33,7 @@
 		.msg pre {
 			background-color: #80808038;
 			border-radius: 10px;
-			padding: 10px 5px;
+			padding: 5px 10px;
 			width: fit-content;
 			/* margin-right: 10px; */
 			margin: 0;
@@ -71,7 +73,7 @@
 			background-color: var(--bg-color);
 			position: absolute;
   			/* bottom: var(--pad); */
-  			bottom: calc(15px +var(--pad));
+  			bottom: calc(15px + var(--pad));
 			left: var(--pad);
 			right: var(--pad);
 		}
@@ -104,7 +106,10 @@
 <div id="message"></div>
 
 <script>
-	const socket = new WebSocket("ws://127.0.0.1:8080");
+	if(isMobile()) {
+		document.body.classList.add('phone');
+	}
+	const socket = new WebSocket("ws://ws.cn:8081");
 
 	socket.onopen = function(event) {
 		// updateStatus('connected', '已连接');
@@ -193,6 +198,9 @@
 		return `${now.getFullYear()}-${m}-${d}${hasTime ? ` ${h}:${mi}:${s}` : ''}`;
 	}
 
+	function isMobile() {
+		return /Mobi/.test(navigator.userAgent);
+	}
 </script>
 </body>
 </html>
