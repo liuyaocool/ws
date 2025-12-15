@@ -10,3 +10,18 @@ submit_accept
 -> handler_read
     submit_write * n
     submit_read
+
+# server run
+
+```bash
+# compile
+make
+# run
+./bin/main 8081
+```
+
+# browser connect
+
+```javascript
+new WebSocket("ws://127.0.0.1:8081");
+```

@@ -31,6 +31,7 @@ struct ucli {
 struct udata {
     // struct ucli *cli; // NULL 为可用状态
     uint8_t buf[BUFFER_SIZE];
+    int offset;
     int use; // 发送使用统计（给几个用户发送）, -1为可用
     // void *handler;
     void (*handler)(struct io_uring_cqe *, int, int);
@@ -159,6 +160,7 @@ int get_udata() {
             // !!!!!! 一个fd的read 影响了其他fd， 找了半天才发现 这里是==
             // udatas[i].use == 0;
             udatas[i].use = 0;
+            udatas[i].offset = 0;
             return i;
         }
     return -1;
@@ -193,7 +195,8 @@ void submit_read(int cidx, int didx) {
         fprintf(stderr, "无法获取 SQE 用于 read \n");
         return;
     }
-    io_uring_prep_recv(sqe, uclis[cidx].fd, &udatas[didx].buf, BUFFER_SIZE, 0);
+    // 或 &udatas[didx].buf[offset]
+    io_uring_prep_recv(sqe, uclis[cidx].fd, udatas[didx].buf + udatas[didx].offset, BUFFER_SIZE - udatas[didx].offset, 0);
     set_data(sqe, cidx, didx);
 }
 
@@ -221,7 +224,7 @@ void submit_close(int cidx, int didx) {
 
 // write_thread
 void handler_write(struct io_uring_cqe *cqe, int cidx, int didx) {
-    printf("handler_write (fd:%d %d:%d)数据长度 %d \n", uclis[cidx].fd, uclis[cidx].ip, uclis[cidx].port, cqe->res);
+    // printf("handler_write (fd:%d %d:%d)数据长度 %d \n", uclis[cidx].fd, uclis[cidx].ip, uclis[cidx].port, cqe->res);
     if (udatas[didx].use > 0) {
         udatas[didx].use--;
     }
@@ -233,22 +236,24 @@ void handler_write(struct io_uring_cqe *cqe, int cidx, int didx) {
 // read_thread
 void handler_close(struct io_uring_cqe *cqe, int cidx, int didx) {
     printc(RED, "-------- %d(fd:%d %d:%d)\n", cidx, uclis[cidx].fd, uclis[cidx].ip, uclis[cidx].port);
+    close(uclis[cidx].fd);
     uclis[cidx].fd = -1;
     udatas[didx].use = -1;
 }
 
 // 解码数据
-int de_data(uint8_t *buf, size_t len, uint8_t *out) {
-    bool fin = (buf[0] & 0x80) != 0; // 1:最后一帧 0:还有数据未完成
+int de_data(const int didx, size_t len, const int oidx) {
+    len += udatas[didx].offset;
+    uint8_t *buf = udatas[didx].buf;
     bool masked = (buf[1] & 0x80) != 0;
     size_t header_len = 2;
     uint64_t data_len = buf[1] & 0x7F;
     if (data_len == 126) {
-        if (len < 4) return 0;  // 帧不完整
+        if (len < 4) goto frame_miss;  // 帧头不完整
         data_len = ((uint64_t)buf[2] << 8) | buf[3];
         header_len = 4;
     } else if (data_len == 127) {
-        if (len < 10) return 0;  // 帧不完整
+        if (len < 10) goto frame_miss;  // 帧头不完整
         data_len = 0;
         // 注意：只取低 63 位（RFC 规定最高位必须为 0）
         for (int i = 0; i < 8; i++) {
@@ -258,14 +263,15 @@ int de_data(uint8_t *buf, size_t len, uint8_t *out) {
     }
     uint8_t mask[4];
     if (masked) {
-        if (len < header_len + 4) return 0;
+        if (len < header_len + 4) goto frame_miss; // 帧头不完整
         memcpy(mask, buf + header_len, 4);
         header_len += 4;
     }
-    if (len < header_len + data_len) return 0; // 帧不完整
-    
+    printf("len=%d, header_len=%d data_len=%d \n", len, header_len, data_len);
+    if (len < header_len + data_len) goto frame_miss; // 帧不完整
     size_t dest_len = 0;
     uint8_t *dest_data;
+    uint8_t *out = udatas[oidx].buf;
     // 第一字节: FIN=1 (0x80) | opcode
     out[0] = 0x80 | (buf[0] & 0x0F);
     // 第二字节: MASK=0 | payload length
@@ -293,21 +299,35 @@ int de_data(uint8_t *buf, size_t len, uint8_t *out) {
     } else {
         memcpy(dest_data, data, data_len);
     }
-    printf("len=%d data = %s\n", data_len, dest_data);
+
+    int this_len = header_len + data_len;
+    // 多余的数据留给下次
+    if ((udatas[didx].offset = len - this_len) > 0) {
+        memmove(buf, buf+this_len, udatas[didx].offset);
+    }
+    
+    // printf("len=%d data = %s\n", data_len, dest_data);
     return dest_len;
+
+    frame_miss:
+    udatas[didx].offset = len;
+    return 0;
+
 }
 // read_thread
 void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
     uint8_t opcode = udatas[didx].buf[0] & 0xF;
+    // 1:最后一帧 0:还有数据未完成
+    // 因为我每次都是发送完整的帧， 且完整的帧都是在buffer范围内的, 所以fin总是1
+    // bool fin = (udatas[didx].buf[0] & 0x80) != 0;
+    // printf(">>>>>> fd=%d len=%d fin=%d opcode=%d\n", uclis[cidx].fd, cqe->res, fin, opcode);
     if (cqe->res <= 0 || 8 == opcode){
-        printf("fd=%d opcode=%d\n", uclis[cidx].fd, opcode);
         udatas[didx].handler = handler_close;
         submit_close(cidx, didx);
         return;
     }
     int send_idx = get_udata();
-    int send_len = de_data(udatas[didx].buf, cqe->res, udatas[send_idx].buf);
-    // printf("<<<<<<<< read len=%d cidx=%d, didx=%d ----- \n", cqe->res, cidx, didx);
+    int send_len = de_data(didx, cqe->res, send_idx);
     // switch (opcode) {
     //     case 0: break; // 继续帧 数据分片 浏览器不会传
     //     case 1: break; // 文本帧
@@ -322,16 +342,17 @@ void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
         udatas[send_idx].handler = handler_write;
         for (size_t i = 0; i < CLIENT_SIZE; i++) {
             if (uclis[i].fd >= 0 && uclis[i].fd != uclis[cidx].fd) {
-                printc(BLUE, ">>>>>>>> write to %d %d -----\n", i, uclis[i].fd);
+                printc(BLUE, ">>>>>>>> write to %d %d, len %d -----\n", i, uclis[i].fd, send_len);
                 udatas[send_idx].use++;
                 submit_write(&write_ring, i, send_idx, send_len);
             }
         }
+        io_uring_submit(&write_ring);
     } else {
         udatas[send_idx].use = -1;
-        printf("fd=%d 收到数据不完整: %d\n", uclis[cidx].fd, cqe->res);
+        printf("...... fd=%d op=%d len=%d send_len=%d 收到数据不完整: %d\n", 
+            uclis[cidx].fd, opcode, udatas[didx].buf[1] & 0x7F, send_len, cqe->res);
     }
-    io_uring_submit(&write_ring);
     submit_read(cidx, didx);
 }
 
@@ -411,8 +432,9 @@ int create_websocket(int port) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
-    // 设置 socket 选项
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+    // bind 时复用处于 TIME_WAIT 状态的本地地址（IP + 端口）， 简单点说就是快速重启不会报错
+    // 不要加 SO_REUSEPORT， 会导致多个进程可绑定同一个端口
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
         goto err_over;
     }

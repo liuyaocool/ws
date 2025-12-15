@@ -7,4 +7,3 @@ t:
 	@mkdir -p bin/
 	@make
 	./bin/main 8081
-	
