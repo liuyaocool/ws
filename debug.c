@@ -34,11 +34,11 @@ void printc(Color color, const char* format, ...) {
 }
 
 void print_first_write(int cidx) {
-    printf("\033[%dm", GREEN);
-    printf("++++++++ client-%d(fd=%d) connect: %s:%d （", cidx, uclis[cidx].fd, 
-        inet_ntoa((struct in_addr){.s_addr = uclis[cidx].ip}), uclis[cidx].port);
-    for (size_t i = 0; i < CLIENT_SIZE; i++)
-        if (uclis[i].fd != -1)
-            printf("%d=%d ", i, uclis[i].fd);
-    printf("）\033[0m\n");
+    // printf("\033[%dm", GREEN);
+    // printf("++++++++ client-%d(fd=%d) connect: %s:%d （", cidx, uclis[cidx].fd, 
+    //     inet_ntoa((struct in_addr){.s_addr = uclis[cidx].ip}), uclis[cidx].port);
+    // for (size_t i = 0; i < CLIENT_SIZE; i++)
+    //     if (uclis[i].fd != -1)
+    //         printf("%d=%d ", i, uclis[i].fd);
+    // printf("）\033[0m\n");
 }

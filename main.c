@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <liburing.h>
 
+// 64位系统 指针占8字节 int占4字节
 #define HALF_SYS_BITS (sizeof(void*) * 4)
 #define BUFFER_SIZE 4096
 #define UR_CQE_SIZE 128
@@ -19,25 +20,37 @@
 #define DATA_SIZE (CLIENT_SIZE * 8) // CLIENT_SIZE = 1+2 的情况
 // 此id在ws RFC 6455协议中是硬编码的
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#define IS_CRLF(c) *(c) == '\r' && *(c + 1) == '\n'
+#define IS_CRLF(c) (*(c) == '\r' && *(c + 1) == '\n')
 
 struct ucli {
     int fd;
     uint32_t ip;
     uint16_t port;
+    // 读数据相关参数
+    bool masked;
+    size_t header_len;
+    uint64_t data_len;
+    uint8_t mask[4];
     // struct sockaddr_in addr; // client addr
     // socklen_t len; // addr len
 };
 struct udata {
-    // struct ucli *cli; // NULL 为可用状态
+    struct ucli *cli; // NULL 为可用状态
+    bool cache; // 是否缓存， false需要释放
+    union {
+        int offset; // 偏移量 拆包问题用
+        int use; // 发送使用统计（给几个用户发送）, -1为可用
+    };
+    void (*handler)(struct io_uring_cqe *, struct udata *);
     uint8_t buf[BUFFER_SIZE];
-    int offset;
-    int use; // 发送使用统计（给几个用户发送）, -1为可用
-    // void *handler;
-    void (*handler)(struct io_uring_cqe *, int, int);
 };
 
-struct ucli uclis[CLIENT_SIZE];
+// struct uudata {
+//     struct ucli *cli; // NULL 为可用状态
+//     struct udata buf;
+// };
+
+struct udata uclis[CLIENT_SIZE];
 struct udata udatas[DATA_SIZE]; // 0专为accept
 struct io_uring read_ring; // 使用liburing库函数操作可实现线程安全
 struct io_uring write_ring;
@@ -79,15 +92,10 @@ int main(int argc, char const *argv[]) {
         fprintf(stderr, "线程创建失败: %s\n", strerror(ret));
         goto err_exit;
     }
-
-    printf("WebSocket服务运行 http://127.0.0.1:%d\n", port);
-
+    printf("运行在端口: %d\n", port);
     init();
-
     submit_accept();
-
     uring_handle((void *) &read_ring);
-
     return 0;
 
     err_exit:
@@ -101,6 +109,7 @@ void* uring_handle(void *arg) {
     size_t i = 0;
     long data;
     int didx, cidx, ur_ret, count;
+    struct udata * udata;
     while (-1 != server_fd) {
         // 获取提交队列状态
         if (ring->sq.sqe_tail > ring->sq.sqe_head) {
@@ -116,11 +125,13 @@ void* uring_handle(void *arg) {
         count = io_uring_peek_batch_cqe(ring, cqes, 10);
         for (i = 0; i < count; i++) {
             cqe = cqes[i];
-            data = (long)io_uring_cqe_get_data(cqe);
-            cidx = data >> HALF_SYS_BITS;
-            didx = data << HALF_SYS_BITS >> HALF_SYS_BITS;
-            udatas[didx].handler(cqe, cidx, didx);
+            // data = (long)io_uring_cqe_get_data(cqe);
+            // cidx = data >> HALF_SYS_BITS;
+            // didx = data << HALF_SYS_BITS >> HALF_SYS_BITS;
+            // udatas[didx].handler(cqe, cidx, didx);
             // ((void (*)(int, struct io_uring_cqe*))udatas[idx].handler)(idx, cqe);
+            udata = (struct udata *)io_uring_cqe_get_data(cqe);
+            udata->handler(cqe, udata);
             // 单个处理
             // io_uring_cqe_seen(&ring, cqe);
         }
@@ -130,12 +141,15 @@ void* uring_handle(void *arg) {
 
 void init() {
     for (size_t i = 0; i < CLIENT_SIZE; i++) {
-        uclis[i].fd = -1;
+        uclis[i].cli = (struct ucli*)malloc(sizeof(struct ucli));
+        uclis[i].use = -1;
         // memset(&uclis[i].addr, 0, sizeof(uclis[i].addr));
         // uclis[i].len = sizeof(uclis[i].addr);
     }
-    for (size_t i = 1; i < DATA_SIZE; i++)
+    for (size_t i = 1; i < DATA_SIZE; i++) {
         udatas[i].use = -1;
+        udatas[i].cache = true;
+    }
 }
 
 void cleanup(int sig) {
@@ -145,25 +159,24 @@ void cleanup(int sig) {
     // exit(sig);
 }
 
-int get_cli() {
+struct udata * get_cli() {
     for (size_t i = 0; i < CLIENT_SIZE; i++)
-        if (uclis[i].fd == -1) {
-            uclis[i].fd = 0;
-            return i;
+        if (uclis[i].use == -1) {
+            uclis[i].use = 0;
+            return &uclis[i];
         }
-    return -1;
+    return NULL;
 }
 
-int get_udata() {
+struct udata * get_udata() {
     for (size_t i = 1; i < DATA_SIZE; i++)
         if (udatas[i].use == -1) {
             // !!!!!! 一个fd的read 影响了其他fd， 找了半天才发现 这里是==
             // udatas[i].use == 0;
             udatas[i].use = 0;
-            udatas[i].offset = 0;
-            return i;
+            return &udatas[i];
         }
-    return -1;
+    return NULL;
 }
 
 void set_nonblocking(int fd) {
@@ -189,18 +202,18 @@ void set_data(struct io_uring_sqe* sqe, int cidx, int didx) {
     #pragma GCC diagnostic pop
 }
 
-void submit_read(int cidx, int didx) {
+void submit_read(struct udata *cli) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&read_ring);
     if (!sqe) {
         fprintf(stderr, "无法获取 SQE 用于 read \n");
         return;
     }
     // 或 &udatas[didx].buf[offset]
-    io_uring_prep_recv(sqe, uclis[cidx].fd, udatas[didx].buf + udatas[didx].offset, BUFFER_SIZE - udatas[didx].offset, 0);
-    set_data(sqe, cidx, didx);
+    io_uring_prep_recv(sqe, cli->cli->fd, cli->buf + cli->offset, BUFFER_SIZE - cli->offset, 0);
+    io_uring_sqe_set_data(sqe, (void*)cli);
 }
 
-void submit_write(struct io_uring * ring, int cidx, int didx, int len) {
+void submit_write(struct io_uring * ring, int fd, struct udata *data, int len) {
     // 获取 SQE
     struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
     if (!sqe) {
@@ -208,43 +221,44 @@ void submit_write(struct io_uring * ring, int cidx, int didx, int len) {
         return;
     }
     // 准备写操作
-    io_uring_prep_send(sqe, uclis[cidx].fd, udatas[didx].buf, len, 0);
-    set_data(sqe, cidx, didx);
+    io_uring_prep_send(sqe, fd, data->buf, len, 0);
+    io_uring_sqe_set_data(sqe, (void*)data);
 }
 
-void submit_close(int cidx, int didx) {
+void submit_close(struct udata *cli) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&read_ring);
     if (!sqe) {
         fprintf(stderr, "无法获取 SQE 用于 close\n");
         return;
     }
-    io_uring_prep_close(sqe, uclis[cidx].fd);
-    set_data(sqe, cidx, didx);
+    io_uring_prep_close(sqe, cli->cli->fd);
+    io_uring_sqe_set_data(sqe, (void*)cli);
 }
 
 // write_thread
-void handler_write(struct io_uring_cqe *cqe, int cidx, int didx) {
+void handler_write(struct io_uring_cqe *cqe, struct udata *data) {
     // printf("handler_write (fd:%d %d:%d)数据长度 %d \n", uclis[cidx].fd, uclis[cidx].ip, uclis[cidx].port, cqe->res);
-    if (udatas[didx].use > 0) {
-        udatas[didx].use--;
+    if (data->use > 0) {
+        data->use--;
     }
-    if (udatas[didx].use == 0) {
-        udatas[didx].use = -1;
+    if (data->use == 0) {
+        data->use = -1;
+        if (!data->cache)
+            free(data);
     }
 }
 
 // read_thread
-void handler_close(struct io_uring_cqe *cqe, int cidx, int didx) {
-    printc(RED, "-------- %d(fd:%d %d:%d)\n", cidx, uclis[cidx].fd, uclis[cidx].ip, uclis[cidx].port);
-    close(uclis[cidx].fd);
-    uclis[cidx].fd = -1;
-    udatas[didx].use = -1;
+void handler_close(struct io_uring_cqe *cqe, struct udata *cli) {
+    printc(RED, "-------- fd:%d %d:%d\n", cli->cli->fd, cli->cli->ip, cli->cli->port);
+    close(cli->cli->fd);
+    cli->use = -1;
 }
 
-// 解码数据
-int de_data(const int didx, size_t len, const int oidx) {
-    len += udatas[didx].offset;
-    uint8_t *buf = udatas[didx].buf;
+// 检查数据
+bool check_data(struct udata *src, size_t len) {
+    uint8_t *buf = src->buf;
+    len += src->offset;
     bool masked = (buf[1] & 0x80) != 0;
     size_t header_len = 2;
     uint64_t data_len = buf[1] & 0x7F;
@@ -261,17 +275,32 @@ int de_data(const int didx, size_t len, const int oidx) {
         }
         header_len = 10;
     }
-    uint8_t mask[4];
     if (masked) {
         if (len < header_len + 4) goto frame_miss; // 帧头不完整
-        memcpy(mask, buf + header_len, 4);
+        memcpy(src->cli->mask, buf + header_len, 4);
         header_len += 4;
     }
-    printf("len=%d, header_len=%d data_len=%d \n", len, header_len, data_len);
+    // printf("len=%d, header_len=%d data_len=%d \n", len, header_len, data_len);
     if (len < header_len + data_len) goto frame_miss; // 帧不完整
+
+    src->cli->data_len = data_len;
+    src->cli->header_len = header_len;
+    src->cli->masked = masked;
+    return true;
+
+    // 帧不完整
+    frame_miss:
+    src->offset = len;
+    return false;
+}
+// 解码数据
+int de_data(struct udata *src, struct udata *dest, size_t len) {
+    uint8_t *buf = src->buf;
+    size_t header_len = src->cli->header_len;
+    uint64_t data_len = src->cli->data_len;
     size_t dest_len = 0;
     uint8_t *dest_data;
-    uint8_t *out = udatas[oidx].buf;
+    uint8_t *out = dest->buf;
     // 第一字节: FIN=1 (0x80) | opcode
     out[0] = 0x80 | (buf[0] & 0x0F);
     // 第二字节: MASK=0 | payload length
@@ -292,9 +321,9 @@ int de_data(const int didx, size_t len, const int oidx) {
     }
     uint8_t *data = buf + header_len;
 
-    if (masked) {
+    if (src->cli->masked) {
         for (size_t i = 0; i < data_len; i++) {
-            dest_data[i] = data[i] ^ mask[i % 4];
+            dest_data[i] = data[i] ^ src->cli->mask[i % 4];
         }
     } else {
         memcpy(dest_data, data, data_len);
@@ -302,32 +331,26 @@ int de_data(const int didx, size_t len, const int oidx) {
 
     int this_len = header_len + data_len;
     // 多余的数据留给下次
-    if ((udatas[didx].offset = len - this_len) > 0) {
-        memmove(buf, buf+this_len, udatas[didx].offset);
+    if ((src->offset = len - this_len) > 0) {
+        memmove(buf, buf+this_len, src->offset);
     }
     
     // printf("len=%d data = %s\n", data_len, dest_data);
     return dest_len;
-
-    frame_miss:
-    udatas[didx].offset = len;
-    return 0;
-
 }
 // read_thread
-void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
-    uint8_t opcode = udatas[didx].buf[0] & 0xF;
+void handler_read(struct io_uring_cqe *cqe, struct udata *cli) {
+    uint8_t opcode = cli->buf[0] & 0xF;
+    size_t len = cqe->res;
     // 1:最后一帧 0:还有数据未完成
     // 因为我每次都是发送完整的帧， 且完整的帧都是在buffer范围内的, 所以fin总是1
     // bool fin = (udatas[didx].buf[0] & 0x80) != 0;
     // printf(">>>>>> fd=%d len=%d fin=%d opcode=%d\n", uclis[cidx].fd, cqe->res, fin, opcode);
     if (cqe->res <= 0 || 8 == opcode){
-        udatas[didx].handler = handler_close;
-        submit_close(cidx, didx);
+        cli->handler = handler_close;
+        submit_close(cli);
         return;
     }
-    int send_idx = get_udata();
-    int send_len = de_data(didx, cqe->res, send_idx);
     // switch (opcode) {
     //     case 0: break; // 继续帧 数据分片 浏览器不会传
     //     case 1: break; // 文本帧
@@ -337,46 +360,52 @@ void handler_read(struct io_uring_cqe *cqe, int cidx, int didx) {
     //     case 10: break; // pong
     //     default: break;
     // }
-    if (send_len > 0) {
-        udatas[send_idx].use = 0;
-        udatas[send_idx].handler = handler_write;
+    if (check_data(cli, len)) {
+        struct udata * w_buf = get_udata();
+        if (NULL ==  w_buf) {
+            w_buf = (struct udata*) malloc(sizeof(struct udata));
+            w_buf->cache = false;
+        }
+        int send_len = de_data(cli, w_buf, len);
+        w_buf->use = 0;
+        w_buf->handler = handler_write;
         for (size_t i = 0; i < CLIENT_SIZE; i++) {
-            if (uclis[i].fd >= 0 && uclis[i].fd != uclis[cidx].fd) {
-                printc(BLUE, ">>>>>>>> write to %d %d, len %d -----\n", i, uclis[i].fd, send_len);
-                udatas[send_idx].use++;
-                submit_write(&write_ring, i, send_idx, send_len);
+            if (uclis[i].use >= 0 && uclis[i].cli->fd != cli->cli->fd) {
+                // printc(BLUE, ">>>>>>>> write to %d %d, len %d -----\n", i, uclis[i].fd, send_len);
+                w_buf->use++;
+                submit_write(&write_ring, uclis[i].cli->fd, w_buf, send_len);
             }
         }
         io_uring_submit(&write_ring);
     } else {
-        udatas[send_idx].use = -1;
-        printf("...... fd=%d op=%d len=%d send_len=%d 收到数据不完整: %d\n", 
-            uclis[cidx].fd, opcode, udatas[didx].buf[1] & 0x7F, send_len, cqe->res);
+        // udatas[send_idx].use = -1;
+        // printf("...... fd=%d op=%d len=%d send_len=%d 收到数据不完整: %d\n", 
+            // uclis[cidx].fd, opcode, udatas[didx].buf[1] & 0x7F, send_len, cqe->res);
     }
-    submit_read(cidx, didx);
+    submit_read(cli);
 }
 
-void handler_first_write(struct io_uring_cqe *cqe, int cidx, int didx) {
-    print_first_write(cidx);
+void handler_first_write(struct io_uring_cqe *cqe, struct udata *cli) {
+    // print_first_write(cidx);
     int bytes_sent = cqe->res;
-    udatas[didx].handler = handler_read;
-    submit_read(cidx, didx);
+    cli->handler = handler_read;
+    submit_read(cli);
 }
 
-void handler_first_read(struct io_uring_cqe *cqe, int cidx, int didx) {
+void handler_first_read(struct io_uring_cqe *cqe, struct udata *cli) {
     int len = cqe->res;
-    if (!IS_CRLF(udatas[didx].buf + len-4) || !IS_CRLF(udatas[didx].buf + len-2)) {
-        printf("非完整数据: %s\n", udatas[didx].buf);
+    if (!IS_CRLF(cli->buf + len-4) || !IS_CRLF(cli->buf + len-2)) {
+        printf("非完整数据: %s\n", cli->buf);
         return;
     }
-    if (!strstr((char *)udatas[didx].buf, "Upgrade: websocket")) {
-        printf("非ws请求: %s\n", udatas[didx].buf);
+    if (!strstr((char *)cli->buf, "Upgrade: websocket")) {
+        printf("非ws请求: %s\n", cli->buf);
         return;
     }
-    char* key_start = strstr((char *)udatas[didx].buf, "Sec-WebSocket-Key: ");
+    char* key_start = strstr((char *)cli->buf, "Sec-WebSocket-Key: ");
     // key 长度固定24
     if (!key_start || !IS_CRLF(key_start+19+24)) {
-        printf("Sec-WebSocket-Key 头出错: %s\n", udatas[didx].buf);
+        printf("Sec-WebSocket-Key 头出错: %s\n", cli->buf);
         return;
     }
     char client_key[25], accept_key[29];
@@ -384,30 +413,31 @@ void handler_first_read(struct io_uring_cqe *cqe, int cidx, int didx) {
     client_key[24] = '\0';
     generate_accept_key(client_key, accept_key);
     
-    memcpy(udatas[didx].buf, 
+    memcpy(cli->buf, 
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: ", 
         97);
-    memcpy(udatas[didx].buf + 97, accept_key, 28);
-    memcpy(udatas[didx].buf + 97 + 28, "\r\n\r\n", 4);
-    udatas[didx].handler = handler_first_write;
+    memcpy(cli->buf + 97, accept_key, 28);
+    memcpy(cli->buf + 97 + 28, "\r\n\r\n", 4);
+    cli->handler = handler_first_write;
 
-    submit_write(&read_ring, cidx, didx, 97+28+4);
+    submit_write(&read_ring, cli->cli->fd, cli, 97+28+4);
 }
 
-void handler_accept(struct io_uring_cqe *cqe, int cidx, int didx) {
+void handler_accept(struct io_uring_cqe *cqe, struct udata* cli) {
     int fd;
     if ((fd = cqe->res) >= 0) {
-        cidx = get_cli();
-        uclis[cidx].fd = fd;
-        uclis[cidx].ip = accept_addr.sin_addr.s_addr;
-        uclis[cidx].port = accept_addr.sin_port;
-        didx = get_udata();
-        udatas[didx].handler = handler_first_read;
-        set_nonblocking(fd);
-        submit_read(cidx, didx);
+        cli = get_cli();
+        if (NULL == cli) {
+            // submit write 满了
+        }
+        cli->cli->fd = fd;
+        cli->cli->ip = accept_addr.sin_addr.s_addr;
+        cli->cli->port = accept_addr.sin_port;
+        cli->handler = handler_first_read;
+        submit_read(cli);
     }
     submit_accept();
 }
@@ -419,9 +449,8 @@ void submit_accept() {
         return;
     }
     udatas[0].handler = handler_accept;
-    // io_uring_prep_accept(sqe, server_fd, (struct sockaddr*)&uclis[cidx].addr, &uclis[cidx].len, 0);
     io_uring_prep_accept(sqe, server_fd, (struct sockaddr*)&accept_addr, &accept_len, 0);
-    io_uring_sqe_set_data(sqe, (void*)(long)0);
+    io_uring_sqe_set_data(sqe, (void*)&udatas[0]);
 }
 
 int create_websocket(int port) {
