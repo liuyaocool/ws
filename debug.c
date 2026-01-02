@@ -21,24 +21,20 @@ typedef enum {
     BRIGHT_WHITE,       // 亮白 (97)
 } Color;
 
+void printc_start(Color color) {
+    printf("\033[%dm", color);
+}
+
+void printc_end() {
+    printf("\033[0m");  // 重置
+}
+
 // 带换行版本
 void printc(Color color, const char* format, ...) {
-    printf("\033[%dm", color);
-    
+    printc_start(color);
     va_list args;
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
-    
-    printf("\033[0m");  // 重置
-}
-
-void print_first_write(int cidx) {
-    // printf("\033[%dm", GREEN);
-    // printf("++++++++ client-%d(fd=%d) connect: %s:%d （", cidx, uclis[cidx].fd, 
-    //     inet_ntoa((struct in_addr){.s_addr = uclis[cidx].ip}), uclis[cidx].port);
-    // for (size_t i = 0; i < CLIENT_SIZE; i++)
-    //     if (uclis[i].fd != -1)
-    //         printf("%d=%d ", i, uclis[i].fd);
-    // printf("）\033[0m\n");
+    printc_end();
 }

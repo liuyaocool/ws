@@ -50,6 +50,7 @@ struct udata {
 //     struct udata buf;
 // };
 
+struct ucli clis[CLIENT_SIZE];
 struct udata uclis[CLIENT_SIZE];
 struct udata udatas[DATA_SIZE]; // 0专为accept
 struct io_uring read_ring; // 使用liburing库函数操作可实现线程安全
@@ -74,6 +75,13 @@ int main(int argc, char const *argv[]) {
     }
     signal(SIGINT, cleanup); // 2 中断信号 Ctrl+C
     signal(SIGTERM, cleanup); // 15 终止信号 kill或其他程序请求终止
+
+    // 方法1: pthread_self() - 返回 pthread_t 类型
+    // pthread_t tid = pthread_self();
+    // printf("main tid: %lu\n", (unsigned long)tid);
+    // 方法2: 获取系统级线程ID (LWP - Light Weight Process)
+    // pid_t sys_tid = syscall(SYS_gettid);
+    // printf("System TID (LWP): %d\n", sys_tid);
     
     pthread_t write_t;
     int port = atoi(argv[1]), ret;
@@ -141,8 +149,9 @@ void* uring_handle(void *arg) {
 
 void init() {
     for (size_t i = 0; i < CLIENT_SIZE; i++) {
-        uclis[i].cli = (struct ucli*)malloc(sizeof(struct ucli));
+        uclis[i].cli = &clis[i];
         uclis[i].use = -1;
+        uclis[i].cache = true;
         // memset(&uclis[i].addr, 0, sizeof(uclis[i].addr));
         // uclis[i].len = sizeof(uclis[i].addr);
     }
@@ -295,6 +304,7 @@ bool check_data(struct udata *src, size_t len) {
 }
 // 解码数据
 int de_data(struct udata *src, struct udata *dest, size_t len) {
+    len += src->offset;
     uint8_t *buf = src->buf;
     size_t header_len = src->cli->header_len;
     uint64_t data_len = src->cli->data_len;
@@ -315,6 +325,7 @@ int de_data(struct udata *src, struct udata *dest, size_t len) {
         dest_data = out + 4;
         dest_len = 4 + data_len;
     } else {
+        // 本程序4k buffer 不会到这一步
         // 注意：RFC 允许 8 字节长度（127），但大多数场景不需要
         // 若需支持 >64KB，可扩展（但浏览器可能不兼容）
         return 0; // 暂不支持超大帧
@@ -334,6 +345,12 @@ int de_data(struct udata *src, struct udata *dest, size_t len) {
     if ((src->offset = len - this_len) > 0) {
         memmove(buf, buf+this_len, src->offset);
     }
+
+    // printf("mask=%d, offset=%d, len=%d, data_len=%d, out(%d)=[", 
+    //     src->cli->masked, src->offset, len, data_len, dest_len);
+    // for (size_t i = 0; i < 4; i++)
+    //     printf("%d, ", out[i]);
+    // printf("...]\n");
     
     // printf("len=%d data = %s\n", data_len, dest_data);
     return dest_len;
@@ -342,6 +359,7 @@ int de_data(struct udata *src, struct udata *dest, size_t len) {
 void handler_read(struct io_uring_cqe *cqe, struct udata *cli) {
     uint8_t opcode = cli->buf[0] & 0xF;
     size_t len = cqe->res;
+    // printf("client-%d offset: %d  len: %d\n", cli->cli->fd, cli->offset, len);
     // 1:最后一帧 0:还有数据未完成
     // 因为我每次都是发送完整的帧， 且完整的帧都是在buffer范围内的, 所以fin总是1
     // bool fin = (udatas[didx].buf[0] & 0x80) != 0;
@@ -385,8 +403,18 @@ void handler_read(struct io_uring_cqe *cqe, struct udata *cli) {
     submit_read(cli);
 }
 
+void print_first_write(struct udata *cli) {
+    printc_start(GREEN);
+    printf("++++++++ fd=%d %s:%d （", cli->cli->fd, 
+        inet_ntoa((struct in_addr){.s_addr = cli->cli->ip}), cli->cli->port);
+    for (size_t i = 0; i < CLIENT_SIZE; i++)
+        if (uclis[i].use != -1) printf("%d=%d ", i, uclis[i].cli->fd);
+    printf(")\n");
+    printc_end();
+}
+
 void handler_first_write(struct io_uring_cqe *cqe, struct udata *cli) {
-    // print_first_write(cidx);
+    print_first_write(cli);
     int bytes_sent = cqe->res;
     cli->handler = handler_read;
     submit_read(cli);

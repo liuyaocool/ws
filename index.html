@@ -39,10 +39,11 @@
 			margin: 0;
 		}
 		.msg video {
-			height: 200px;
+			max-height: 600px;
+    		max-width: 80%;
 		}
 		.msg img {
-			max-width: 100%;
+			max-width: 90%;
 		}
 		.ot_msg pre {
 			/* margin-left: 5px; */
@@ -68,6 +69,7 @@
 		}
 		.btn {
 			background-color: gray;
+			line-height: 19px;
 		}
 		.send {
 			float: right;
@@ -91,6 +93,9 @@
   			bottom: calc(15px + var(--pad));
 			left: var(--pad);
 			right: var(--pad);
+		}
+		#fileProgress {
+			font-size: 12px;
 		}
 		#message {
 			position: absolute;
@@ -117,8 +122,9 @@
 	<!-- </div> -->
 </div>
 <div class="func">
-	<input class="btn" type="button" value="???">
+	<input id="statusBtn" class="btn" type="button" value="???">
 	<input class="btn" type="button" value="file" onclick="sendFile()">
+	<span id="fileProgress"></span>
 	<input class="btn send" type="button" value="发送" onclick="sendInput()">
 	<!-- <button id="send" type="button">发送</button> -->
 	<textarea id="textInput"></textarea>
@@ -129,21 +135,28 @@
 	// if(isMobile()) {
 	// 	document.body.classList.add('phone');
 	// }
-
-	const MAX_PART_LEN = 4096-14, socket = new WebSocket(`ws://${location.host}/ws`);
-	// const MAX_PART_LEN = 4096-14, socket = new WebSocket(`ws://127.0.0.1:8082`);
-	socket.binaryType = 'arraybuffer';
+	const worker = new Worker('upload_worker.js');
 	const FILE_BUFFER = {};
 
-	socket.onopen = function(event) {
-		// updateStatus('connected', '已连接');
-		showMsg('I', '已成功连接到WebSocket服务器', 'system');
+	worker.onmessage = e => {
+		switch (e.data.type) {
+			case 'open': recvOpen(e.data); return;
+			case 'message': recvMessage(e.data); return;
+			case 'close': recvClose(e.data); return;
+			case 'error': recvError(e.data); return;
+			case 'send_text': recvSendText(e.data); return;
+			case 'progress': recvProgress(e.data); return; 
+		}
+		console.log(e);
+	}
+
+	function recvOpen(event) {
+		updateStatus('open');
+		// showMsg('I', '已成功连接到WebSocket服务器', 'system');
 	};
 	
-	socket.onmessage = function(e) {
-		console.log(e.data);
+	function recvMessage(e) {
 		if (e.data instanceof ArrayBuffer) {
-			
 			const uint8Arr = new Uint8Array(e.data);
 			const id = uint8Arr[0] << 8 | uint8Arr[1];
 			const idx = uint8Arr[2] << 8 | uint8Arr[3];
@@ -166,27 +179,23 @@
 		}
 	};
 	
-	socket.onclose = function(event) {
-		updateStatus('disconnected', '连接已断开');
-		if (event.wasClean) {
-			showMsg('I', `连接已关闭，代码: ${event.code}, 原因: ${event.reason}`, 'system');
-		} else {
-			showMsg('E', '连接意外断开', 'system');
-		}
+	function recvClose(event) {
+		updateStatus('close', `${event.code}${event.reason ? ('-' + event.reason) : ''}`);
+		// if (event.wasClean) {
+		// 	showMsg('I', `连接已关闭，代码: ${event.code}, 原因: ${event.reason}`, 'system');
+		// } else {
+		// 	showMsg('E', '连接意外断开', 'system');
+		// }
 	};
 	
-	socket.onerror = function(error) {
-		updateStatus('disconnected', '连接错误');
-		showMsg('E', '连接发生错误', 'system');
-		console.error('WebSocket错误:', error);
+	function recvError(error) {
+		// updateStatus('error', error);
+		showMsg('E', '连接发生错误: ' + error);
 	};
 
 	// 断开WebSocket连接
 	function disconnect() {
-		if (socket) {
-			socket.close();
-			socket = null;
-		}
+		worker.postMessage({type: 'socket_close' });
 	}
 
 
@@ -200,49 +209,35 @@
 		
 		// 发送消息
 	function sendInput() {
-		const msg = textInput.value;
-		if(sendString(JSON.stringify({type: 'input', value: msg}))) {
-			addMsg('my_msg', msg);
-		}
+		let msg = textInput.value;
+		if (!msg || !msg.trim()) return;
+		msg = JSON.stringify({type: 'input', value: msg});
+		worker.postMessage({
+			type: 'send_text',
+			text: msg,
+		});
 	}
-
-	function sendString(message) {
-		if (!message) return;
-		if (socket && socket.readyState === WebSocket.OPEN) {
-			socket.send(message);
-			return true;
+	function recvSendText(e) {
+		if (e.success) {
+			let msg = JSON.parse(e.msg);
+			addMsg('my_msg', msg.value);
+		} else {
+			showMsg('E', '无法发送消息，连接未就绪', 'system');
 		}
-		showMsg('E', '无法发送消息，连接未就绪', 'system');
-		return false;
 	}
 
 	async function sendFile() {
 		// (0x34 << 8) | 0x45 
-		const file = await fileChooser(), 
-			id = new Uint8Array(2),
-			partSize = MAX_PART_LEN - 4;
-		crypto.getRandomValues(id);
-		// console.log(`file size = ${file.size}`);
-		sendString(JSON.stringify({
-			type: 'file', 
-			id: id[0] << 8 | id[1], 
-			partCount: Math.trunc(file.size / partSize) + (file.size % partSize > 0 ? 1 : 0),
-			size: file.size, 
-			name: file.name, 
-			ftype: file.type,
-		}));
-		let start = 0, index = 0;
-		do {
-			socket.send(new Blob([
-					new Uint8Array([id[0], id[1], index >> 8, index & 0xff]),
-					// [start, end)
-					file.slice(start, start + partSize)
-				], {type: 'application/octet-stream'}
-			));
-			console.log(`start = ${start}; part size = ${file.slice(start, start + partSize).size}`);
-			start += partSize;
-			index++;
-		} while (start < file.size);
+		const file = await fileChooser();
+		worker.postMessage({
+			type: 'send_file',
+			file: file
+		});
+	}
+	function recvProgress(e) {
+		fileProgress.innerHTML = 
+			`${Math.round(e.loaded/e.total*10000)/100}% <span style="color:gray">${e.name}<span>`;
+		// showMsg('W', `上传(${Math.round(e.loaded/e.total*10000)/100}%): ${e.name}`);
 	}
 
 	function addFile(clas, name, url, type) {
@@ -251,7 +246,7 @@
 		} else if(name.endsWith('.mp4')) {
 			addMsgHtm(clas, `<video src="${url}" controls></video>`);
 		} else {
-			addMsgHtm(clas, `<div>${name}<a href="${url}" download class="down"></a></div>`);
+			addMsgHtm(clas, `<div>${name}<a href="${url}" download="${name}" class="down"></a></div>`);
 		}
 	}
 
@@ -259,9 +254,12 @@
 		addMsgHtm(clas, `<pre class="">${msg}</pre>`);
 	}
 	function addMsgHtm(clas, htm) {
-		msgs.innerHTML += `<div class="msg ${clas}">
-			<div class="time">${nowStr(true)}</div>
-			${htm}</div>`;
+		msgs.insertAdjacentHTML('beforeend', 
+        	`<div class="msg ${clas}">
+				<div class="time">${nowStr(true)}</div>
+				${htm}
+			</div>`
+		);
 		msgs.scrollTo({
 			top: msgs.scrollHeight,
 			behavior: 'smooth'
@@ -274,11 +272,17 @@
 			case 'W': message.innerHTML = `<yellow>${msg}</yellow>`; break;
 			case 'E': message.innerHTML = `<red>${msg}</red>`; break;
 		}
-		console.log(msg);
 	}
 
-	function updateStatus() {
-
+	function updateStatus(status, text) {
+		let statusMap = {
+			open: ['green', '已连接'],
+			error: ['#690000', '出错了'],
+			close: ['#9e6601', '已关闭'],
+		};
+		if (!statusMap[status]) return;
+		statusBtn.style.backgroundColor = statusMap[status][0];
+		statusBtn.value = statusMap[status][1] + (text ? `: ${text}` : '');
 	}
 
 	function nowStr(hasTime) {
