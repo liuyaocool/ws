@@ -1,11 +1,9 @@
 // upload-worker.js - Worker线程，纯数据处理
 const socketUrl = `ws://${location.host}/ws-api`;
-// const socketUrl = `ws://127.0.0.1:8080`;
-
-const FRAME_LEN = 4096, 
-    MAX_PART_LEN = FRAME_LEN-14, 
-    socket = new WebSocket(socketUrl);
-socket.binaryType = 'arraybuffer';
+// const socketUrl = `ws://${location.host}/ws-api2`;
+const FRAME_LEN = 4096, MAX_PART_LEN = FRAME_LEN-14;
+let socket;
+socket_init();
 
 // 1. message - 接收主线程消息（最常用）
 self.addEventListener('message', (e) => {
@@ -16,22 +14,41 @@ self.addEventListener('message', (e) => {
     }
 });
 
+function socket_init(onopen) {
+    disconnect();
+    socket = new WebSocket(socketUrl);
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = (e) => {
+        socket_onopen(e);
+        if (typeof onopen == 'function') {
+            onopen();
+        }
+    }
+    socket.onmessage = socket_onmessage;
+    socket.onclose = socket_onclose;
+    socket.onerror = socket_onerror;
+}
+
 function sendText(text) {
     if (!text || !text.trim())
         return;
-    let success = false;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(text);
-        success = true;
+    if (!check_socket()) {
+        socket_init(() => sendText(text));
+        return;
     }
+    socket.send(text);
     self.postMessage({
         type: 'send_text',
-        success: success,
+        success: true,
         msg: text
     });
 }
 
 function sendFile(file) {
+    if (!check_socket()) {
+        socket_init(() => sendFile(file));
+        return;
+    }
     // (0x34 << 8) | 0x45 
     const id = new Uint8Array(2),
         partSize = MAX_PART_LEN - 4;
@@ -64,20 +81,20 @@ function sendFile(file) {
     } while (start < file.size);
 }
 
-socket.onopen = function(event) {
+function socket_onopen(event) {
     self.postMessage({
         type: 'open',
     });
 };
 
-socket.onmessage = function(e) {
+function socket_onmessage(e) {
     self.postMessage({
         type: 'message',
         data: e.data,
     });
 };
 
-socket.onclose = function(event) {
+function socket_onclose(event) {
     console.log(event);
     self.postMessage({
         type: 'close',
@@ -87,13 +104,17 @@ socket.onclose = function(event) {
     });
 };
 
-socket.onerror = function(error) {
+function socket_onerror(error) {
     self.postMessage({
         type: 'error',
         error: error.message,
     });
     console.error('WebSocket错误:', error.message);
 };
+
+function check_socket() {
+    return socket && socket.readyState === WebSocket.OPEN;
+}
 
 function disconnect() {
     if (socket) {
