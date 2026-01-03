@@ -1,6 +1,6 @@
 // upload-worker.js - Worker线程，纯数据处理
-// const socketUrl = `ws://${location.host}/ws-api`;
-const socketUrl = `ws://127.0.0.1:8080`;
+const socketUrl = `ws://${location.host}/ws-api`;
+// const socketUrl = `ws://127.0.0.1:8080`;
 
 const FRAME_LEN = 4096, 
     MAX_PART_LEN = FRAME_LEN-14, 
