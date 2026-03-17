@@ -122,7 +122,7 @@
 	<!-- </div> -->
 </div>
 <div class="func">
-	<input id="statusBtn" class="btn" type="button" value="???">
+	<input id="statusBtn" onclick="reconn()" class="btn" type="button" value="???">
 	<input class="btn" type="button" value="file" onclick="sendFile()">
 	<span id="fileProgress"></span>
 	<input class="btn send" type="button" value="发送" onclick="sendInput()">
@@ -149,6 +149,10 @@
 		}
 		console.log(e);
 	}
+
+    function reconn() {
+        worker.postMessage({type: 'socket_init' });
+    }
 
 	function recvOpen(event) {
 		updateStatus('open');

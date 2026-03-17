@@ -6,4 +6,4 @@ all:
 t:
 	@mkdir -p bin/
 	@make
-	./bin/main 8081
+	./bin/main 8082

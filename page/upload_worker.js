@@ -11,6 +11,7 @@ self.addEventListener('message', (e) => {
         case "send_file": sendFile(e.data.file); break;
         case "send_text": sendText(e.data.text); break;
         case "socket_close": disconnect(); break;
+        case "socket_init": socket_init(); break;
     }
 });
 
